@@ -53,12 +53,6 @@ class MainActivity : Activity() {
             setPadding(dp(20), dp(16), dp(20), dp(24))
         }
 
-        col.addView(TextView(this).apply {
-            text = getString(R.string.app_name)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 26f)
-            typeface = Typeface.DEFAULT_BOLD
-        })
-
         status = TextView(this).apply {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
             setPadding(0, dp(12), 0, dp(8))
