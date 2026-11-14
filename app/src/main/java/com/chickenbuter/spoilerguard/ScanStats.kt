@@ -2,6 +2,19 @@ package com.chickenbuter.spoilerguard
 
 import android.os.SystemClock
 
+/** Почему пришлось обойти окно целиком. */
+enum class FullReason(val label: String) {
+    NEW("новое окно"),
+    STATE("смена экрана"),
+    BOUNDS("окно сдвинулось"),
+    SETTLE("после прокрутки"),
+    SAFETY("подстраховка"),
+    BIG_CHANGE("большое изменение"),
+    OVERFLOW("много событий"),
+    ERROR("ошибка"),
+    PREFS("старт/настройки"),
+}
+
 /** Статистика сканов для экрана настроек. Живёт в процессе приложения, никуда не пишется. */
 object ScanStats {
     /** Вызов дольше этого порога — настоящий запрос к приложению, а не ответ из кеша. */
@@ -25,6 +38,7 @@ object ScanStats {
     private var requests = 0L       // из них настоящие запросы к приложению
     private var requestNs = 0L      // суммарное ожидание ответа
     private var lastRequests = 0
+    private val reasons = LongArray(FullReason.values().size)
 
     @Volatile var cacheInfo = "неизвестно"
 
@@ -37,6 +51,12 @@ object ScanStats {
         var calls = 0
         var requests = 0
         var requestNs = 0L
+        val reasons = IntArray(FullReason.values().size)
+
+        fun fullScan(reason: FullReason) {
+            full++
+            reasons[reason.ordinal]++
+        }
 
         /** Засекает обращение к элементу. */
         inline fun <T> call(block: () -> T): T {
@@ -66,6 +86,7 @@ object ScanStats {
         calls += s.calls
         requests += s.requests
         requestNs += s.requestNs
+        for (i in reasons.indices) reasons[i] += s.reasons[i].toLong()
         if (s.full == 0 && s.listDiff == 0 && s.subtree == 0 && s.refreshed == 0) {
             idle++
             return
@@ -90,6 +111,7 @@ object ScanStats {
         lastMs = 0L; lastNodes = 0; lastKind = ""; lastMatches = 0; lastRequests = 0
         maxMs = 0L; avgMs = 0.0
         calls = 0L; requests = 0L; requestNs = 0L
+        reasons.fill(0L)
     }
 
     @Synchronized
@@ -106,6 +128,11 @@ object ScanStats {
             append("Сканов: ").append(scans).append(", без чтения экрана: ").append(idle).append('\n')
             append("Полных: ").append(fullWindows).append(", строк: ").append(listDiffs)
             append(", поддеревьев: ").append(subtrees).append(", проверок: ").append(refreshed).append('\n')
+            val why = FullReason.values()
+                .filter { reasons[it.ordinal] > 0 }
+                .sortedByDescending { reasons[it.ordinal] }
+                .joinToString(", ") { it.label + " " + reasons[it.ordinal] }
+            if (why.isNotEmpty()) append("Почему полные: ").append(why).append('\n')
             append("Обращений: ").append(calls).append(", из кеша: ").append(hitRate).append("%\n")
             append("Ответ приложения: ").append(String.format("%.1f", avgReqMs)).append(" мс на запрос\n")
             append("Кеш элементов: ").append(cacheInfo).append('\n')

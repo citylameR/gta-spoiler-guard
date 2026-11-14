@@ -94,7 +94,7 @@ class MainActivity : Activity() {
         col.addView(blurHint)
 
         switch(prefs, "Закрывать карточку целиком", Prefs.KEY_COVER_CARD, Prefs.coverCard(prefs))
-        col.addView(hint("Вместе с текстом закрывается пост или превью видео целиком, включая картинку."))
+        col.addView(hint("Закрывается вся строка ленты, где нашёлся текст: пост, сообщение, карточка видео вместе с картинкой. Альбомы в Telegram — целиком."))
 
         switch(prefs, "Параноидальный режим прокрутки", Prefs.KEY_PARANOID, Prefs.paranoid(prefs))
         col.addView(hint("Пока лента прокручивается, она закрыта целиком и открывается после проверки. Ничего не мелькнёт, но листать будет непривычно."))

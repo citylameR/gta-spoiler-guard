@@ -83,9 +83,11 @@ class SpoilerGuardService : AccessibilityService(),
     private class Hit(
         val spoiler: Boolean,               // false — основная фраза, true — слово-спойлер
         val textNode: AccessibilityNodeInfo,
-        var target: AccessibilityNodeInfo,  // карточка вокруг текста (или сам текст)
+        var target: AccessibilityNodeInfo,  // строка списка / карточка вокруг текста (или сам текст)
         val textBounds: Rect,
-        val rect: Rect,
+        val targetBounds: Rect,             // где был target, когда считали area
+        val area: Rect,                     // что закрываем: target + соседи по полосе (без обрезки)
+        val rect: Rect,                     // area, обрезанная окном, — это и рисуем
     )
 
     private class WindowState(val pkg: String) {
@@ -119,7 +121,8 @@ class SpoilerGuardService : AccessibilityService(),
     // ========== Работа, накопленная из событий: пишет главный поток, читает фоновый ==========
 
     @Volatile private var allDirty = true
-    private val fullDirty: MutableSet<Int> = ConcurrentHashMap.newKeySet()
+    /** Окно → почему его надо обойти целиком (первая причина побеждает). */
+    private val fullDirty = ConcurrentHashMap<Int, FullReason>()
     private val scrolledWindows: MutableSet<Int> = ConcurrentHashMap.newKeySet()
     private val contentEvents = ConcurrentLinkedQueue<AccessibilityEvent>()
     private val scrollEvents = ConcurrentLinkedQueue<AccessibilityEvent>()
@@ -127,9 +130,13 @@ class SpoilerGuardService : AccessibilityService(),
     /** Окна, где шла прокрутка: после остановки один раз обойдём их полностью. */
     private val settleWindows: MutableSet<Int> = ConcurrentHashMap.newKeySet()
     private val settleRunnable = Runnable {
-        fullDirty.addAll(settleWindows)
+        for (id in settleWindows) markFull(id, FullReason.SETTLE)
         settleWindows.clear()
         scheduleScan()
+    }
+
+    private fun markFull(windowId: Int, reason: FullReason) {
+        if (windowId >= 0) fullDirty.putIfAbsent(windowId, reason)
     }
 
     private val scanScheduled = AtomicBoolean(false)
@@ -235,16 +242,24 @@ class SpoilerGuardService : AccessibilityService(),
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null || !enabled) return
         val type = event.eventType
-        if (event.packageName?.toString() == packageName) {
-            // Своё окно не сканируем, но при открытии настроек пересчитываем остальные.
-            if (type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
-        }
+        if (event.packageName?.toString() == packageName) return // своё окно не сканируем
         val windowId = event.windowId
 
         when {
-            type == AccessibilityEvent.TYPE_WINDOWS_CHANGED ||
-                type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
-                windowId < 0 -> allDirty = true
+            type == AccessibilityEvent.TYPE_WINDOWS_CHANGED -> {
+                // Добавленные окна скан найдёт сам (их нет в кеше), удалённые выбросит из кеша.
+                // Фокус, заголовок, порядок окон на содержимое не влияют.
+                // Обходим заново только окно, которое сдвинулось или изменило размер.
+                if ((event.windowChanges and AccessibilityEvent.WINDOWS_CHANGE_BOUNDS) != 0) {
+                    markFull(windowId, FullReason.BOUNDS)
+                }
+            }
+
+            type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ->
+                markFull(windowId, FullReason.STATE)
+
+            // Уведомления и прочее без окна: если появилось новое окно, его найдёт скан.
+            windowId < 0 -> {}
 
             type == AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
                 scrolledWindows.add(windowId)
@@ -252,7 +267,7 @@ class SpoilerGuardService : AccessibilityService(),
                 if (scrollEvents.size < MAX_QUEUED_EVENTS) {
                     scrollEvents.add(AccessibilityEvent(event))
                 } else {
-                    fullDirty.add(windowId)
+                    markFull(windowId, FullReason.OVERFLOW)
                 }
                 settleWindows.add(windowId)
                 main.removeCallbacks(settleRunnable)
@@ -264,11 +279,11 @@ class SpoilerGuardService : AccessibilityService(),
                 if (contentEvents.size < MAX_QUEUED_EVENTS) {
                     contentEvents.add(AccessibilityEvent(event))
                 } else {
-                    fullDirty.add(windowId)
+                    markFull(windowId, FullReason.OVERFLOW)
                 }
             }
 
-            else -> fullDirty.add(windowId)
+            else -> markFull(windowId, FullReason.BIG_CHANGE)
         }
         scheduleScan()
     }
@@ -321,7 +336,7 @@ class SpoilerGuardService : AccessibilityService(),
 
         val all = allDirty
         allDirty = false
-        val full = HashSet(fullDirty).also { fullDirty.removeAll(it) }
+        val full = HashMap(fullDirty).also { snap -> snap.keys.forEach { fullDirty.remove(it) } }
         val scrolled = HashSet(scrolledWindows).also { scrolledWindows.removeAll(it) }
         val scrollEvs = drain(scrollEvents)
         val contentEvs = drain(contentEvents)
@@ -379,13 +394,18 @@ class SpoilerGuardService : AccessibilityService(),
         val fullDone = HashSet<Int>()
         for ((id, w) in byId) {
             val st = windowCache[id]
-            val safety = st != null && st.safetyDue && startedAt - st.lastFullAt >= SAFETY_FULL_INTERVAL_MS
-            if (!(all || st == null || id in full || safety)) continue
+            val reason = when {
+                all -> FullReason.PREFS
+                st == null -> FullReason.NEW
+                full[id] != null -> full[id]
+                st.safetyDue && startedAt - st.lastFullAt >= SAFETY_FULL_INTERVAL_MS -> FullReason.SAFETY
+                else -> null
+            } ?: continue
             if (!all && st != null && startedAt - st.lastFullAt < FULL_SCAN_MIN_INTERVAL_MS) {
-                fullDirty.add(id) // слишком часто — отложим, но не потеряем
+                markFull(id, reason) // слишком часто — отложим, но не потеряем
                 continue
             }
-            val res = fullScan(w, ctx) ?: continue
+            val res = fullScan(w, reason, ctx) ?: continue
             windowCache[id] = res
             fullDone.add(id)
         }
@@ -399,15 +419,15 @@ class SpoilerGuardService : AccessibilityService(),
             if (id in fullDone) continue
             val st = windowCache[id]
             val w = byId[id] ?: continue
-            if (st == null) { fullDirty.add(id); continue }
+            if (st == null) { markFull(id, FullReason.NEW); continue }
             if (st.pkg == packageName) continue
             val src = ctx.stats.call { try { ev.source } catch (e: Exception) { null } } ?: continue
             if (!handled.add(src)) continue // этот элемент уже обработан в этом скане
             try {
-                if (!handleChange(st, src, bounds(w), isScroll, ctx)) fullDirty.add(id)
+                if (!handleChange(st, src, bounds(w), isScroll, ctx)) markFull(id, FullReason.BIG_CHANGE)
                 touched.add(id)
             } catch (e: Exception) {
-                fullDirty.add(id)
+                markFull(id, FullReason.ERROR)
             }
         }
 
@@ -426,7 +446,7 @@ class SpoilerGuardService : AccessibilityService(),
                     val fresh = ctx.stats.call { node.refresh() }
                     if (fresh) rescanSubtree(st, node, wb, ctx)
                 } catch (e: Exception) {
-                    fullDirty.add(id)
+                    markFull(id, FullReason.ERROR)
                 }
                 touched.add(id)
             }
@@ -542,7 +562,7 @@ class SpoilerGuardService : AccessibilityService(),
         ctx.stats.subtree++
     }
 
-    private fun fullScan(w: AccessibilityWindowInfo, ctx: Ctx): WindowState? {
+    private fun fullScan(w: AccessibilityWindowInfo, reason: FullReason, ctx: Ctx): WindowState? {
         val root = ctx.stats.call { try { rootOf(w) } catch (e: Exception) { null } } ?: return null
         val pkg = root.packageName?.toString() ?: ""
         val st = WindowState(pkg)
@@ -553,9 +573,9 @@ class SpoilerGuardService : AccessibilityService(),
         } catch (e: Exception) {
             // Дерево поменялось прямо во время обхода — пересканируем в следующий раз.
             Log.w(TAG, "Ошибка обхода окна", e)
-            fullDirty.add(w.id)
+            markFull(w.id, FullReason.ERROR)
         }
-        ctx.stats.full++
+        ctx.stats.fullScan(reason)
         return st
     }
 
@@ -593,11 +613,19 @@ class SpoilerGuardService : AccessibilityService(),
             if (mt == null || !(mt.matches(text) || mt.matches(desc))) { itr.remove(); continue }
             if (h.target !== h.textNode) {
                 val ok = ctx.stats.call { try { h.target.refresh() } catch (e: Exception) { false } }
-                if (!ok) h.target = h.textNode
+                if (!ok) {
+                    h.target = h.textNode
+                    h.textNode.getBoundsInScreen(h.targetBounds)
+                    h.area.set(h.targetBounds)
+                }
             }
             h.textNode.getBoundsInScreen(h.textBounds)
-            val r = Rect()
-            h.target.getBoundsInScreen(r)
+            // Соседи по полосе (альбом) едут вместе со строкой: сдвигаем всю область на её сдвиг.
+            val nb = Rect()
+            h.target.getBoundsInScreen(nb)
+            h.area.offset(nb.left - h.targetBounds.left, nb.top - h.targetBounds.top)
+            h.targetBounds.set(nb)
+            val r = Rect(h.area)
             if (!r.intersect(wb) || r.isEmpty) { itr.remove(); continue }
             h.rect.set(r)
         }
@@ -658,19 +686,91 @@ class SpoilerGuardService : AccessibilityService(),
         wb: Rect,
         ctx: Ctx,
     ) {
-        val target = if (ctx.card) expandToCard(node, wb, ctx) else node
-        val r = Rect()
-        target.getBoundsInScreen(r)
+        var target = node
+        val area = Rect(textBounds)
+        if (ctx.card) {
+            val row = findListRow(node, st, ctx)
+            if (row != null) {
+                target = row.first
+                area.set(rowWithNeighbors(row.first, row.second, ctx))
+            } else {
+                target = expandToCard(node, wb, ctx)
+                target.getBoundsInScreen(area)
+            }
+        }
+        val targetBounds = Rect().also { target.getBoundsInScreen(it) }
+        val r = Rect(area)
         if (!r.intersect(wb) || r.isEmpty) return
         // Тот же элемент мог быть найден раньше (переиспользованная строка) — заменяем.
         st.hits.removeAll { it.textNode == node }
-        st.hits.add(Hit(spoiler, node, target, textBounds, r))
+        st.hits.add(Hit(spoiler, node, target, textBounds, targetBounds, area, r))
     }
 
     /**
-     * Поднимаемся от совпавшего текста к родителям, пока элемент похож на «карточку»
-     * (пост, превью видео, сообщение), а не на весь список. Так закрывается и превью-картинка
-     * рядом с заголовком, которую само дерево элементов прочитать не может.
+     * Ищет строку ближайшего прокручиваемого списка, в которой лежит [node]:
+     * поднимается по родителям, пока родитель не окажется списком.
+     * Возвращает (строка, список) или null, если списка рядом нет.
+     * Родители подгружаются одним запросом (FLAG_PREFETCH_ANCESTORS).
+     */
+    private fun findListRow(
+        node: AccessibilityNodeInfo,
+        st: WindowState,
+        ctx: Ctx,
+    ): Pair<AccessibilityNodeInfo, AccessibilityNodeInfo>? {
+        var cur = node
+        for (level in 0 until ROW_MAX_LEVELS) {
+            val c = cur
+            val parent = ctx.stats.call { try { parentOf(c) } catch (e: Exception) { null } } ?: return null
+            val isList = st.lists.containsKey(parent) || (parent.isScrollable && parent.childCount >= 2)
+            if (isList) return cur to parent
+            cur = parent
+        }
+        return null
+    }
+
+    /**
+     * Область строки + соседних строк того же списка, стоящих в той же полосе по высоте.
+     * Так альбом в Telegram (каждое фото — отдельная строка, подпись у первой)
+     * закрывается целиком. В обычной ленте строки идут друг под другом — соседей нет.
+     * В горизонтальных каруселях и пейджерах (строка во всю высоту списка) соседей не берём,
+     * иначе закрыли бы всю карусель.
+     */
+    private fun rowWithNeighbors(row: AccessibilityNodeInfo, list: AccessibilityNodeInfo, ctx: Ctx): Rect {
+        val union = Rect()
+        row.getBoundsInScreen(union)
+        val lb = Rect()
+        list.getBoundsInScreen(lb)
+        if (lb.height() <= 0 || union.height() >= lb.height() * HORIZONTAL_LIST_ROW_FRACTION) return union
+
+        val candidates = ArrayList<Rect>()
+        for (i in 0 until list.childCount) {
+            val sib = ctx.stats.call { try { siblingOf(list, i) } catch (e: Exception) { null } } ?: continue
+            if (sib == row) continue
+            val sb = Rect()
+            sib.getBoundsInScreen(sb)
+            if (!sb.isEmpty) candidates.add(sb)
+        }
+        var changed = true
+        while (changed && candidates.isNotEmpty()) {
+            changed = false
+            val itr = candidates.iterator()
+            while (itr.hasNext()) {
+                val sb = itr.next()
+                val overlap = minOf(union.bottom, sb.bottom) - maxOf(union.top, sb.top)
+                val minH = minOf(union.height(), sb.height())
+                if (overlap > 0 && overlap >= minH * NEIGHBOR_MIN_OVERLAP) {
+                    union.union(sb)
+                    itr.remove()
+                    changed = true
+                }
+            }
+        }
+        return union
+    }
+
+    /**
+     * Запасной вариант, когда списка рядом нет: поднимаемся от совпавшего текста к родителям,
+     * пока элемент похож на «карточку», а не на весь экран (не выше 45% и не больше 40% площади).
      */
     private fun expandToCard(node: AccessibilityNodeInfo, wb: Rect, ctx: Ctx): AccessibilityNodeInfo {
         val maxH = wb.height() * CARD_MAX_HEIGHT_FRACTION
@@ -755,13 +855,19 @@ class SpoilerGuardService : AccessibilityService(),
         private const val PARTIAL_MAX_AREA_FRACTION = 0.6f
         private const val MAX_NODES_PER_SCAN = 5000
         private const val CARD_MAX_LEVELS = 6
+        private const val ROW_MAX_LEVELS = 15
+        private const val HORIZONTAL_LIST_ROW_FRACTION = 0.8f
+        private const val NEIGHBOR_MIN_OVERLAP = 0.5f
         private const val CARD_MAX_HEIGHT_FRACTION = 0.45f
         private const val CARD_MAX_AREA_FRACTION = 0.40f
         private const val CONTEXT_TTL_MS = 3 * 60_000L
         private const val SCROLL_QUIET_MS = 120L
         private const val PARANOID_MIN_HEIGHT_FRACTION = 0.4f
+        // Соседи + потомки: при первом обращении к ребёнку приходят и его братья
+        // (мы всегда читаем всех детей подряд), и часть его поддерева.
         private const val PREFETCH =
-            AccessibilityNodeInfo.FLAG_PREFETCH_DESCENDANTS_DEPTH_FIRST or
+            AccessibilityNodeInfo.FLAG_PREFETCH_SIBLINGS or
+                AccessibilityNodeInfo.FLAG_PREFETCH_DESCENDANTS_HYBRID or
                 AccessibilityNodeInfo.FLAG_PREFETCH_UNINTERRUPTIBLE
     }
 }
