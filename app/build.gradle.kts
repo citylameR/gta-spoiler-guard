@@ -11,8 +11,8 @@ android {
         applicationId = "com.chickenbuter.spoilerguard"
         minSdk = 31          // Android 12+
         targetSdk = 36
-        versionCode = 3
-        versionName = "0.3"
+        versionCode = 4
+        versionName = "0.4"
     }
 
     // Постоянный ключ, лежит в репозитории (личное приложение, репо приватный).
