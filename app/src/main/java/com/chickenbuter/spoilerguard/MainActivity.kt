@@ -6,6 +6,8 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.Typeface
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.text.InputType
 import android.util.TypedValue
@@ -29,6 +31,14 @@ class MainActivity : Activity() {
     private lateinit var openSettings: Button
     private lateinit var blurHint: TextView
     private lateinit var col: LinearLayout
+    private lateinit var stats: TextView
+    private val ui = Handler(Looper.getMainLooper())
+    private val statsTick = object : Runnable {
+        override fun run() {
+            stats.text = ScanStats.summary()
+            ui.postDelayed(this, 1000)
+        }
+    }
 
     private fun dp(v: Int) = TypedValue.applyDimension(
         TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics
@@ -61,6 +71,20 @@ class MainActivity : Activity() {
             }
         }
         col.addView(openSettings)
+
+        section("Скорость")
+        stats = TextView(this).apply {
+            typeface = Typeface.MONOSPACE
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        }
+        col.addView(stats)
+        col.addView(Button(this).apply {
+            text = "Сбросить статистику"
+            setOnClickListener {
+                ScanStats.reset()
+                stats.text = ScanStats.summary()
+            }
+        })
 
         col.addView(hint(
             "Если переключатель сервиса серый и написано «Ограниченная настройка»: " +
@@ -127,8 +151,15 @@ class MainActivity : Activity() {
         setContentView(scroll)
     }
 
+    override fun onPause() {
+        super.onPause()
+        ui.removeCallbacks(statsTick)
+    }
+
     override fun onResume() {
         super.onResume()
+        ui.removeCallbacks(statsTick)
+        ui.post(statsTick)
         val on = isServiceEnabled()
         status.text = if (on) "✅ Сервис включён"
         else "⚠️ Сервис выключен. Включи его в спецвозможностях: «Скачанные приложения» → GTA Spoiler Guard."

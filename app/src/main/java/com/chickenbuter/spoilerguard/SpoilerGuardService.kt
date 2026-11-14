@@ -4,6 +4,7 @@ import android.accessibilityservice.AccessibilityService
 import android.content.SharedPreferences
 import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
@@ -62,6 +63,11 @@ class SpoilerGuardService : AccessibilityService(),
     /** Пакет приложения → когда в нём последний раз видели упоминание GTA. */
     private val gtaSeenAt = ConcurrentHashMap<String, Long>()
 
+    /** Результаты по окнам: неизменившиеся окна не пересканируем. Только фоновый поток. */
+    private val windowCache = HashMap<Int, WindowResult>()
+    private val dirtyWindows: MutableSet<Int> = ConcurrentHashMap.newKeySet()
+    @Volatile private var allDirty = true
+
     private val scanScheduled = AtomicBoolean(false)
     @Volatile private var lastScanAt = 0L
     @Volatile private var lastBigScrollAt = 0L
@@ -103,6 +109,7 @@ class SpoilerGuardService : AccessibilityService(),
 
     override fun onSharedPreferenceChanged(p: SharedPreferences?, key: String?) {
         reloadPrefs()
+        allDirty = true
         main.post {
             if (!enabled || !paranoid) overlay?.setVeil(null)
             render(if (enabled) lastRects else emptyList())
@@ -155,6 +162,21 @@ class SpoilerGuardService : AccessibilityService(),
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null || !enabled) return
+        if (event.packageName?.toString() == packageName) {
+            // Своё окно не сканируем, но при открытии настроек пересчитываем остальные.
+            if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+        }
+
+        // Пересканируем только окна, в которых что-то поменялось.
+        val type = event.eventType
+        if (type == AccessibilityEvent.TYPE_WINDOWS_CHANGED ||
+            type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+            event.windowId < 0
+        ) {
+            allDirty = true
+        } else {
+            dirtyWindows.add(event.windowId)
+        }
 
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
             onScrolled(event)
@@ -199,12 +221,17 @@ class SpoilerGuardService : AccessibilityService(),
 
     /** Выполняется на фоновом потоке. */
     private fun scan() {
-        // Сбрасываем флаг до обхода: события, пришедшие во время скана, запланируют ещё один.
+        // Сбрасываем флаги до обхода: события, пришедшие во время скана, запланируют ещё один.
         scanScheduled.set(false)
         val startedAt = SystemClock.uptimeMillis()
         lastScanAt = startedAt
+        val all = allDirty
+        allDirty = false
+        val dirty = HashSet(dirtyWindows)
+        dirtyWindows.removeAll(dirty)
 
         if (!enabled) {
+            windowCache.clear()
             main.post {
                 overlay?.setVeil(null)
                 render(emptyList())
@@ -213,10 +240,12 @@ class SpoilerGuardService : AccessibilityService(),
         }
 
         val m = matcher
-        val sm = spoilerMatcher
-        val useContext = contextEnabled
+        val sm = if (contextEnabled) spoilerMatcher else null
         val card = coverCard
         val found = ArrayList<Rect>()
+        val live = HashSet<Int>()
+        var scannedWindows = 0
+        var visitedNodes = 0
 
         val ws: List<AccessibilityWindowInfo> = try {
             windows ?: emptyList()
@@ -227,33 +256,38 @@ class SpoilerGuardService : AccessibilityService(),
         for (w in ws) {
             if (w.type == AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY) continue
             if (w.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) continue
-            val root = try { w.root } catch (e: Exception) { null } ?: continue
-            val pkg = root.packageName?.toString() ?: ""
-            // Своё окно не трогаем, иначе закроем список слов в настройках.
-            if (pkg == packageName) continue
+            val id = w.id
+            live.add(id)
 
-            val windowBounds = Rect()
-            w.getBoundsInScreen(windowBounds)
-            val gtaHits = ArrayList<Rect>()
-            val spoilerHits = ArrayList<Rect>()
-            try {
-                collectMatches(root, m, if (useContext) sm else null, card, windowBounds, gtaHits, spoilerHits)
-            } catch (e: Exception) {
-                // Дерево могло поменяться прямо во время обхода — просто пропускаем окно.
-                Log.w(TAG, "Ошибка обхода окна", e)
+            var res = windowCache[id]
+            if (all || res == null || id in dirty) {
+                res = scanWindow(w, m, sm, card) ?: continue
+                windowCache[id] = res
+                scannedWindows++
+                visitedNodes += res.visited
             }
+            // Своё окно не трогаем, иначе закроем список слов в настройках.
+            if (res.pkg == packageName) continue
 
-            found.addAll(gtaHits)
-            if (gtaHits.isNotEmpty() && pkg.isNotEmpty()) gtaSeenAt[pkg] = startedAt
-            if (spoilerHits.isNotEmpty()) {
-                val seen = gtaSeenAt[pkg]
-                val contextActive = gtaHits.isNotEmpty() ||
+            found.addAll(res.gta)
+            if (res.gta.isNotEmpty() && res.pkg.isNotEmpty()) gtaSeenAt[res.pkg] = startedAt
+            if (res.spoiler.isNotEmpty()) {
+                val seen = gtaSeenAt[res.pkg]
+                val contextActive = res.gta.isNotEmpty() ||
                     (seen != null && startedAt - seen <= CONTEXT_TTL_MS)
-                if (contextActive) found.addAll(spoilerHits)
+                if (contextActive) found.addAll(res.spoiler)
             }
         }
+        windowCache.keys.retainAll(live)
 
         val result = mergeOverlapping(found)
+        ScanStats.record(
+            durationMs = SystemClock.uptimeMillis() - startedAt,
+            windows = scannedWindows,
+            nodes = visitedNodes,
+            matches = result.size,
+        )
+
         main.post {
             render(result)
             // Ленту открываем, только если этот скан начался уже после остановки прокрутки.
@@ -270,6 +304,39 @@ class SpoilerGuardService : AccessibilityService(),
         }
     }
 
+    private class WindowResult(
+        val pkg: String,
+        val gta: List<Rect>,
+        val spoiler: List<Rect>,
+        val visited: Int,
+    )
+
+    private fun scanWindow(
+        w: AccessibilityWindowInfo,
+        m: KeywordMatcher,
+        sm: KeywordMatcher?,
+        card: Boolean,
+    ): WindowResult? {
+        val root = try { rootOf(w) } catch (e: Exception) { null } ?: return null
+        val pkg = root.packageName?.toString() ?: ""
+        if (pkg == packageName) return WindowResult(pkg, emptyList(), emptyList(), 0)
+
+        val windowBounds = Rect()
+        w.getBoundsInScreen(windowBounds)
+        val gta = ArrayList<Rect>()
+        val spoiler = ArrayList<Rect>()
+        val visited = try {
+            collectMatches(root, m, sm, card, windowBounds, gta, spoiler)
+        } catch (e: Exception) {
+            // Дерево могло поменяться прямо во время обхода — пересканируем в следующий раз.
+            Log.w(TAG, "Ошибка обхода окна", e)
+            dirtyWindows.add(w.id)
+            0
+        }
+        return WindowResult(pkg, gta, spoiler, visited)
+    }
+
+    /** Возвращает число просмотренных элементов. */
     private fun collectMatches(
         root: AccessibilityNodeInfo,
         m: KeywordMatcher,
@@ -278,14 +345,21 @@ class SpoilerGuardService : AccessibilityService(),
         windowBounds: Rect,
         gtaOut: MutableList<Rect>,
         spoilerOut: MutableList<Rect>,
-    ) {
+    ): Int {
         val stack = ArrayDeque<AccessibilityNodeInfo>()
         stack.push(root)
         var visited = 0
+        val b = Rect()
 
         while (stack.isNotEmpty() && visited < MAX_NODES_PER_WINDOW) {
             val node = stack.pop()
             visited++
+
+            // Элемент целиком за пределами экрана (длинная страница в Chrome, ScrollView) —
+            // пропускаем его вместе со всеми детьми. Пустые обёртки (0×0) не трогаем:
+            // у них бывают видимые дети.
+            node.getBoundsInScreen(b)
+            if (!b.isEmpty && !Rect.intersects(b, windowBounds)) continue
 
             // Поле ввода не закрываем, чтобы было видно, что печатаешь.
             if (!node.isEditable) {
@@ -308,11 +382,25 @@ class SpoilerGuardService : AccessibilityService(),
             }
 
             for (i in node.childCount - 1 downTo 0) {
-                val child = try { node.getChild(i) } catch (e: Exception) { null }
+                val child = try { childOf(node, i) } catch (e: Exception) { null }
                 if (child != null) stack.push(child)
             }
         }
+        return visited
     }
+
+    // Android 13+: каждый запрос к приложению сразу подтягивает пачку соседних элементов
+    // (до 50) в локальный кеш, и следующие getChild() отвечают без межпроцессного вызова.
+    private fun rootOf(w: AccessibilityWindowInfo): AccessibilityNodeInfo? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) w.getRoot(PREFETCH) else w.root
+
+    private fun childOf(n: AccessibilityNodeInfo, i: Int): AccessibilityNodeInfo? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) n.getChild(i, PREFETCH) else n.getChild(i)
+
+    private fun parentOf(n: AccessibilityNodeInfo): AccessibilityNodeInfo? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+            n.getParent(AccessibilityNodeInfo.FLAG_PREFETCH_ANCESTORS)
+        else n.parent
 
     /**
      * Поднимаемся от совпавшего текста к родителям, пока элемент похож на «карточку»
@@ -323,7 +411,7 @@ class SpoilerGuardService : AccessibilityService(),
         val maxH = windowBounds.height() * CARD_MAX_HEIGHT_FRACTION
         val maxArea = windowBounds.width().toLong() * windowBounds.height() * CARD_MAX_AREA_FRACTION
         var best = node
-        var cur: AccessibilityNodeInfo? = node.parent
+        var cur: AccessibilityNodeInfo? = parentOf(node)
         var levels = 0
         val b = Rect()
         while (cur != null && levels < CARD_MAX_LEVELS) {
@@ -331,7 +419,7 @@ class SpoilerGuardService : AccessibilityService(),
             val area = b.width().toLong() * b.height()
             if (b.height() > maxH || area > maxArea) break
             best = cur
-            cur = cur.parent
+            cur = parentOf(cur)
             levels++
         }
         return best
@@ -371,7 +459,10 @@ class SpoilerGuardService : AccessibilityService(),
         private const val CARD_MAX_HEIGHT_FRACTION = 0.45f
         private const val CARD_MAX_AREA_FRACTION = 0.40f
         private const val CONTEXT_TTL_MS = 3 * 60_000L
-        private const val SCROLL_QUIET_MS = 150L
+        private const val SCROLL_QUIET_MS = 120L
+        private const val PREFETCH =
+            AccessibilityNodeInfo.FLAG_PREFETCH_DESCENDANTS_DEPTH_FIRST or
+                AccessibilityNodeInfo.FLAG_PREFETCH_UNINTERRUPTIBLE
         private const val PARANOID_MIN_HEIGHT_FRACTION = 0.4f
     }
 }
