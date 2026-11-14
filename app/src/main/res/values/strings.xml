@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">GTA Spoiler Guard</string>
+    <string name="service_label">GTA Spoiler Guard</string>
+    <string name="tile_label">Спойлеры GTA</string>
+    <string name="service_description">Ищет на экране упоминания GTA 6 и закрывает их плашкой. Ничего не сохраняет и не отправляет: у приложения нет доступа в интернет.</string>
+</resources>
