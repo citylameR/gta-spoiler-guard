@@ -11,15 +11,28 @@ android {
         applicationId = "com.chickenbuter.spoilerguard"
         minSdk = 31          // Android 12+
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 2
+        versionName = "0.2"
+    }
+
+    // Постоянный ключ, лежит в репозитории (личное приложение, репо приватный).
+    // Благодаря ему каждая новая сборка из CI ставится поверх старой без удаления.
+    signingConfigs {
+        create("personal") {
+            storeFile = file("personal.keystore")
+            storePassword = "spoilerguard"
+            keyAlias = "personal"
+            keyPassword = "spoilerguard"
+        }
     }
 
     buildTypes {
-        // Личное приложение: release подписываем debug-ключом, чтобы APK сразу ставился.
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("personal")
+        }
+        debug {
+            signingConfig = signingConfigs.getByName("personal")
         }
     }
 
