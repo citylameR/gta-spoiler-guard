@@ -3,6 +3,7 @@ package com.chickenbuter.spoilerguard
 import android.app.Activity
 import android.content.ComponentName
 import android.content.Intent
+import android.content.SharedPreferences
 import android.graphics.Typeface
 import android.os.Bundle
 import android.provider.Settings
@@ -12,6 +13,7 @@ import android.view.Gravity
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.WindowInsets
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -25,6 +27,8 @@ class MainActivity : Activity() {
 
     private lateinit var status: TextView
     private lateinit var openSettings: Button
+    private lateinit var blurHint: TextView
+    private lateinit var col: LinearLayout
 
     private fun dp(v: Int) = TypedValue.applyDimension(
         TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics
@@ -34,7 +38,7 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         val prefs = Prefs.get(this)
 
-        val col = LinearLayout(this).apply {
+        col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(16), dp(20), dp(24))
         }
@@ -52,7 +56,6 @@ class MainActivity : Activity() {
         col.addView(status)
 
         openSettings = Button(this).apply {
-            text = "Открыть настройки спецвозможностей"
             setOnClickListener {
                 startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             }
@@ -65,62 +68,51 @@ class MainActivity : Activity() {
                 "«Разрешить ограниченные настройки», потом включи сервис ещё раз."
         ))
 
-        col.addView(Switch(this).apply {
-            text = "Защита включена"
-            isChecked = Prefs.isEnabled(prefs)
-            setPadding(0, dp(16), 0, dp(4))
-            setOnCheckedChangeListener { _, on ->
-                prefs.edit().putBoolean(Prefs.KEY_ENABLED, on).apply()
-            }
-        })
+        switch(prefs, "Защита включена", Prefs.KEY_ENABLED, Prefs.isEnabled(prefs))
         col.addView(hint("То же самое переключается плиткой «Спойлеры GTA» в шторке — добавь её через карандаш в быстрых настройках."))
 
-        col.addView(Switch(this).apply {
-            text = "Закрывать карточку целиком"
-            isChecked = Prefs.coverCard(prefs)
-            setPadding(0, dp(16), 0, dp(4))
-            setOnCheckedChangeListener { _, on ->
-                prefs.edit().putBoolean(Prefs.KEY_COVER_CARD, on).apply()
-            }
-        })
-        col.addView(hint("Вместе с текстом закрывается пост или превью видео целиком, включая картинку. Если выключить, закрывается только сам текст."))
+        switch(prefs, "Блюр вместо плашки", Prefs.KEY_BLUR, Prefs.blur(prefs))
+        blurHint = hint("")
+        col.addView(blurHint)
 
-        col.addView(TextView(this).apply {
-            text = "Слова и фразы (по одной на строку)"
-            typeface = Typeface.DEFAULT_BOLD
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-            setPadding(0, dp(20), 0, dp(4))
-        })
-        col.addView(hint("Регистр не важен. Пробел = любой разделитель или слитно: «gta 6» ловит GTA6, GTA-6, #gta_6. Совпадение только целым словом. Строки с // — комментарии."))
+        switch(prefs, "Закрывать карточку целиком", Prefs.KEY_COVER_CARD, Prefs.coverCard(prefs))
+        col.addView(hint("Вместе с текстом закрывается пост или превью видео целиком, включая картинку."))
 
-        val editor = EditText(this).apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
-                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-            gravity = Gravity.TOP or Gravity.START
-            minLines = 8
-            typeface = Typeface.MONOSPACE
-            setText(Prefs.keywords(prefs).joinToString("\n"))
-        }
-        col.addView(editor, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        switch(prefs, "Параноидальный режим прокрутки", Prefs.KEY_PARANOID, Prefs.paranoid(prefs))
+        col.addView(hint("Пока лента прокручивается, она закрыта целиком и открывается после проверки. Ничего не мелькнёт, но листать будет непривычно."))
+
+        switch(prefs, "Слова-спойлеры рядом с GTA", Prefs.KEY_CONTEXT_ENABLED, Prefs.contextEnabled(prefs))
+        col.addView(hint("Слова из второго списка (концовка, умер, ending…) закрываются, только если на экране есть GTA или в этом приложении GTA была за последние 3 минуты."))
+
+        section("Всегда закрывать")
+        col.addView(hint("По одной фразе на строку. Регистр не важен. Пробел = любой разделитель или слитно: «gta 6» ловит GTA6, GTA-6, #gta_6. * в конце = любое окончание: «леонид*». Строки с // — комментарии."))
+        val keywordsEditor = editor(Prefs.keywords(prefs))
+
+        section("Слова-спойлеры (только рядом с GTA)")
+        val spoilerEditor = editor(Prefs.spoilerWords(prefs))
 
         val buttons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         buttons.addView(Button(this).apply {
             text = "Сохранить"
             setOnClickListener {
-                prefs.edit().putString(Prefs.KEY_KEYWORDS, editor.text.toString()).apply()
+                prefs.edit()
+                    .putString(Prefs.KEY_KEYWORDS, keywordsEditor.text.toString())
+                    .putString(Prefs.KEY_SPOILER_WORDS, spoilerEditor.text.toString())
+                    .apply()
                 Toast.makeText(this@MainActivity, "Сохранено", Toast.LENGTH_SHORT).show()
             }
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         buttons.addView(Button(this).apply {
             text = "Стандартные"
             setOnClickListener {
-                prefs.edit().remove(Prefs.KEY_KEYWORDS).apply()
-                editor.setText(Prefs.DEFAULT_KEYWORDS.joinToString("\n"))
+                prefs.edit().remove(Prefs.KEY_KEYWORDS).remove(Prefs.KEY_SPOILER_WORDS).apply()
+                keywordsEditor.setText(Prefs.DEFAULT_KEYWORDS.joinToString("\n"))
+                spoilerEditor.setText(Prefs.DEFAULT_SPOILER_WORDS.joinToString("\n"))
             }
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         col.addView(buttons)
 
-        col.addView(hint("Само это окно сервис не закрывает, поэтому список слов здесь всегда виден. Доступа в интернет у приложения нет."))
+        col.addView(hint("Само это окно сервис не закрывает, поэтому списки здесь всегда видны. Доступа в интернет у приложения нет."))
 
         val scroll = ScrollView(this).apply {
             isFillViewport = true
@@ -138,8 +130,13 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         val on = isServiceEnabled()
-        status.text = if (on) "✅ Сервис включён" else "⚠️ Сервис выключен. Включи его в спецвозможностях: «Скачанные приложения» → GTA Spoiler Guard."
+        status.text = if (on) "✅ Сервис включён"
+        else "⚠️ Сервис выключен. Включи его в спецвозможностях: «Скачанные приложения» → GTA Spoiler Guard."
         openSettings.text = if (on) "Настройки спецвозможностей" else "Включить в спецвозможностях"
+
+        val blurOk = getSystemService(WindowManager::class.java)?.isCrossWindowBlurEnabled == true
+        blurHint.text = if (blurOk) "Системный блюр доступен."
+        else "Сейчас система отключила блюр (энергосбережение или настройка «Размытие на уровне окон» в разделе для разработчиков) — будут плашки."
     }
 
     private fun isServiceEnabled(): Boolean {
@@ -148,6 +145,37 @@ class MainActivity : Activity() {
             contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
         ) ?: return false
         return list.split(':').any { ComponentName.unflattenFromString(it) == me }
+    }
+
+    private fun switch(prefs: SharedPreferences, title: String, key: String, value: Boolean) {
+        col.addView(Switch(this).apply {
+            text = title
+            isChecked = value
+            setPadding(0, dp(16), 0, dp(4))
+            setOnCheckedChangeListener { _, on -> prefs.edit().putBoolean(key, on).apply() }
+        })
+    }
+
+    private fun section(title: String) {
+        col.addView(TextView(this).apply {
+            text = title
+            typeface = Typeface.DEFAULT_BOLD
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setPadding(0, dp(20), 0, dp(4))
+        })
+    }
+
+    private fun editor(lines: List<String>): EditText {
+        val e = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            gravity = Gravity.TOP or Gravity.START
+            minLines = 6
+            typeface = Typeface.MONOSPACE
+            setText(lines.joinToString("\n"))
+        }
+        col.addView(e, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        return e
     }
 
     private fun hint(s: String) = TextView(this).apply {
